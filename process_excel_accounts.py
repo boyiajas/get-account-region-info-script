@@ -9,7 +9,7 @@ import sys
 import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +44,8 @@ MAX_WORKERS = 6
 DEFAULT_ACCOUNT_COLUMN_INDEX = 2
 START_ROW = 2
 FILE_NOTE_LIMIT = 3
+LOOKUP_MODE_ACCOUNT_NUMBER = "account_number"
+LOOKUP_MODE_FILE_REFERENCE = "file_reference"
 PREFERRED_MATTER_TYPE_ID = "4"
 DEFENDANT_ROLE_ID = "103"
 DEFENDANT_SORTER = "1"
@@ -54,6 +56,12 @@ ACCOUNT_HEADER_CANDIDATES = {
     "account_no",
     "account no",
 }
+FILE_REFERENCE_HEADER_CANDIDATES = {
+    "file_reference",
+    "file reference",
+    "fileref",
+    "file ref",
+}
 OUTPUT_HEADERS = [
     "file_reference",
     "branch",
@@ -62,7 +70,7 @@ OUTPUT_HEADERS = [
     "matter_description",
     "formatteddateinstructed",
     "casenumber",
-    "laststageid",
+    "laststagedescription",
     "last_file_note_1",
     "last_file_note_2",
     "last_file_note_3",
@@ -75,7 +83,7 @@ OUTPUT_COLUMN_WIDTHS = {
     "matter_description": 40,
     "formatteddateinstructed": 20,
     "casenumber": 20,
-    "laststageid": 14,
+    "laststagedescription": 30,
     "last_file_note_1": 60,
     "last_file_note_2": 60,
     "last_file_note_3": 60,
@@ -123,6 +131,7 @@ def default_output_path(source_path: str) -> str:
 class LegalSuiteClient:
     api_base: str
     api_key: str
+    stage_description_cache: dict[str, str] = field(default_factory=dict)
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -148,6 +157,15 @@ class LegalSuiteClient:
         items = self._post(
             "matter/get",
             {"where[]": f"Matter.TheirRef,=,{account_number}"},
+        )
+        if not items:
+            return None
+        return max(items, key=score_matter)
+
+    def get_matter_by_fileref(self, file_reference: str) -> Optional[dict]:
+        items = self._post(
+            "matter/get",
+            {"where[]": f"Matter.FileRef,=,{file_reference}"},
         )
         if not items:
             return None
@@ -195,6 +213,27 @@ class LegalSuiteClient:
             {"where[]": f"FileNote.MatterID,=,{matter_id}"},
         )
         return items or []
+
+    def get_stage_by_id(self, stage_id: str) -> Optional[dict]:
+        items = self._post(
+            "stage/get",
+            {"where[]": f"Stage.RecordID,=,{stage_id}"},
+        )
+        if not items:
+            return None
+        return items[0]
+
+    def get_stage_description(self, stage_id: str) -> str:
+        normalized_stage_id = str(stage_id or "").strip()
+        if not normalized_stage_id:
+            return ""
+        cached = self.stage_description_cache.get(normalized_stage_id)
+        if cached is not None:
+            return cached
+        stage = self.get_stage_by_id(normalized_stage_id)
+        description = str(stage.get("description") or "").strip() if stage else ""
+        self.stage_description_cache[normalized_stage_id] = description
+        return description
 
 
 def post_with_retry(url: str, headers: dict[str, str], data, timeout: int = 60) -> Optional[requests.Response]:
@@ -270,7 +309,7 @@ def extract_name_from_description(description: str, account_number: str) -> tupl
 def get_defendant_name(
     matter: dict,
     client: LegalSuiteClient,
-    account_number: str,
+    reference_value: str,
 ) -> tuple[str, str]:
     matter_id = str(matter.get("recordid") or "")
     if matter_id:
@@ -317,7 +356,7 @@ def get_defendant_name(
 
     return extract_name_from_description(
         str(matter.get("description") or ""),
-        account_number,
+        reference_value,
     )
 
 
@@ -358,27 +397,36 @@ def build_output_defaults(fill_value: str) -> dict[str, str]:
     return {header_name: fill_value for header_name in OUTPUT_HEADERS}
 
 
-def search_matter(account_number: str, clients: dict[str, LegalSuiteClient]) -> tuple[Optional[dict], Optional[LegalSuiteClient]]:
+def search_matter(
+    lookup_mode: str,
+    lookup_value: str,
+    clients: dict[str, LegalSuiteClient],
+) -> tuple[Optional[dict], Optional[LegalSuiteClient]]:
     for env_name in API_KEY_ENVS:
         client = clients.get(env_name)
         if not client:
             continue
-        matter = client.get_matter_by_theirref(account_number)
+        if lookup_mode == LOOKUP_MODE_FILE_REFERENCE:
+            matter = client.get_matter_by_fileref(lookup_value)
+        else:
+            matter = client.get_matter_by_theirref(lookup_value)
         if matter:
             return matter, client
     return None, None
 
 
-def process_account(account_number: str, clients: dict[str, LegalSuiteClient]) -> dict[str, str]:
-    matter, client = search_matter(account_number, clients)
+def process_lookup(lookup_mode: str, lookup_value: str, clients: dict[str, LegalSuiteClient]) -> dict[str, str]:
+    matter, client = search_matter(lookup_mode, lookup_value, clients)
     if matter and client:
+        reference_value = str(matter.get("theirref") or lookup_value)
         defendant_first_name, defendant_surname = get_defendant_name(
             matter,
             client,
-            account_number,
+            reference_value,
         )
         matter_id = str(matter.get("recordid") or "")
         last_file_notes = get_last_file_notes(matter_id, client) if matter_id else [""] * FILE_NOTE_LIMIT
+        last_stage_description = client.get_stage_description(str(matter.get("laststageid") or ""))
         result = {
             "file_reference": matter.get("fileref", ""),
             "branch": matter.get("branchdescription", ""),
@@ -387,7 +435,7 @@ def process_account(account_number: str, clients: dict[str, LegalSuiteClient]) -
             "matter_description": matter.get("description", ""),
             "formatteddateinstructed": matter.get("formatteddateinstructed", "") or "",
             "casenumber": matter.get("casenumber", "") or "",
-            "laststageid": matter.get("laststageid", "") or "",
+            "laststagedescription": last_stage_description,
         }
         for index, note_text in enumerate(last_file_notes, start=1):
             result[f"last_file_note_{index}"] = note_text
@@ -407,23 +455,47 @@ def normalize_account_number(value: object) -> str:
     return text if text.isdigit() else ""
 
 
+def normalize_file_reference(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def normalize_header_value(value: object) -> str:
     if value is None:
         return ""
     return " ".join(str(value).strip().lower().replace("_", " ").split())
 
 
-def find_account_column_index(header_row: list[object]) -> int:
+def find_column_index(header_row: list[object], candidates: set[str]) -> Optional[int]:
     for index, value in enumerate(header_row, start=1):
-        if normalize_header_value(value) in ACCOUNT_HEADER_CANDIDATES:
+        if normalize_header_value(value) in candidates:
             return index
-    return DEFAULT_ACCOUNT_COLUMN_INDEX
+    return None
 
 
-def read_workbook_rows(workbook_path: str) -> tuple[list[dict], list[str]]:
+def find_lookup_strategy(header_row: list[object]) -> tuple[str, int]:
+    file_reference_column_index = find_column_index(header_row, FILE_REFERENCE_HEADER_CANDIDATES)
+    if file_reference_column_index:
+        return LOOKUP_MODE_FILE_REFERENCE, file_reference_column_index
+
+    account_column_index = find_column_index(header_row, ACCOUNT_HEADER_CANDIDATES)
+    if account_column_index:
+        return LOOKUP_MODE_ACCOUNT_NUMBER, account_column_index
+
+    return LOOKUP_MODE_ACCOUNT_NUMBER, DEFAULT_ACCOUNT_COLUMN_INDEX
+
+
+def normalize_lookup_value(lookup_mode: str, value: object) -> str:
+    if lookup_mode == LOOKUP_MODE_FILE_REFERENCE:
+        return normalize_file_reference(value)
+    return normalize_account_number(value)
+
+
+def read_workbook_rows(workbook_path: str) -> tuple[list[dict], list[tuple[str, str]]]:
     workbook = load_workbook(workbook_path, read_only=True, data_only=True)
     sheet_payloads = []
-    unique_accounts = set()
+    unique_lookup_keys: set[tuple[str, str]] = set()
 
     for sheet_name in workbook.sheetnames:
         worksheet = workbook[sheet_name]
@@ -433,65 +505,68 @@ def read_workbook_rows(workbook_path: str) -> tuple[list[dict], list[str]]:
                 {
                     "sheet_name": sheet_name,
                     "rows": [],
-                    "account_column_index": DEFAULT_ACCOUNT_COLUMN_INDEX,
+                    "lookup_mode": LOOKUP_MODE_ACCOUNT_NUMBER,
+                    "lookup_column_index": DEFAULT_ACCOUNT_COLUMN_INDEX,
                 }
             )
             continue
 
-        account_column_index = find_account_column_index(rows[0])
-        print(f"Sheet '{sheet_name}': using account column {account_column_index}")
+        lookup_mode, lookup_column_index = find_lookup_strategy(rows[0])
+        print(f"Sheet '{sheet_name}': using {lookup_mode} column {lookup_column_index}")
 
         for row_idx in range(START_ROW - 1, len(rows)):
             row = rows[row_idx]
-            account_number = normalize_account_number(
-                row[account_column_index - 1] if len(row) >= account_column_index else None
+            lookup_value = normalize_lookup_value(
+                lookup_mode,
+                row[lookup_column_index - 1] if len(row) >= lookup_column_index else None,
             )
-            if account_number:
-                unique_accounts.add(account_number)
+            if lookup_value:
+                unique_lookup_keys.add((lookup_mode, lookup_value))
 
         sheet_payloads.append(
             {
                 "sheet_name": sheet_name,
                 "rows": rows,
-                "account_column_index": account_column_index,
+                "lookup_mode": lookup_mode,
+                "lookup_column_index": lookup_column_index,
             }
         )
 
-    return sheet_payloads, sorted(unique_accounts)
+    return sheet_payloads, sorted(unique_lookup_keys)
 
 
-def build_account_results(
-    account_numbers: list[str],
+def build_lookup_results(
+    lookup_keys: list[tuple[str, str]],
     clients: dict[str, LegalSuiteClient],
 ) -> dict[str, dict[str, str]]:
-    account_results: dict[str, dict[str, str]] = {}
+    lookup_results: dict[tuple[str, str], dict[str, str]] = {}
     completed = 0
     found_count = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_account = {
-            executor.submit(process_account, account_number, clients): account_number
-            for account_number in account_numbers
+        future_to_lookup = {
+            executor.submit(process_lookup, lookup_mode, lookup_value, clients): (lookup_mode, lookup_value)
+            for lookup_mode, lookup_value in lookup_keys
         }
-        for future in as_completed(future_to_account):
-            account_number = future_to_account[future]
+        for future in as_completed(future_to_lookup):
+            lookup_key = future_to_lookup[future]
             result = future.result()
-            account_results[account_number] = result
+            lookup_results[lookup_key] = result
             completed += 1
             if result["file_reference"] != "NOT FOUND":
                 found_count += 1
-            if completed % 50 == 0 or completed == len(account_numbers):
+            if completed % 50 == 0 or completed == len(lookup_keys):
                 print(
-                    f"Processed {completed}/{len(account_numbers)} unique accounts "
+                    f"Processed {completed}/{len(lookup_keys)} unique lookups "
                     f"(found {found_count})"
                 )
 
-    return account_results
+    return lookup_results
 
 
 def create_excel_report(
     sheet_payloads: list[dict],
-    account_results: dict[str, dict[str, str]],
+    lookup_results: dict[tuple[str, str], dict[str, str]],
     output_path: str,
 ) -> tuple[int, int]:
     workbook = Workbook()
@@ -507,18 +582,20 @@ def create_excel_report(
         if not rows:
             continue
 
-        account_column_index = sheet_payload["account_column_index"]
+        lookup_mode = sheet_payload["lookup_mode"]
+        lookup_column_index = sheet_payload["lookup_column_index"]
         header = list(rows[0]) + OUTPUT_HEADERS
         worksheet.append(header)
 
         for row_idx, row in enumerate(rows[1:], start=2):
             output_row = list(row)
-            account_number = normalize_account_number(
-                row[account_column_index - 1] if len(row) >= account_column_index else None
+            lookup_value = normalize_lookup_value(
+                lookup_mode,
+                row[lookup_column_index - 1] if len(row) >= lookup_column_index else None,
             )
-            if row_idx >= START_ROW and account_number:
+            if row_idx >= START_ROW and lookup_value:
                 processed_rows += 1
-                result = account_results.get(account_number, build_output_defaults("NOT FOUND"))
+                result = lookup_results.get((lookup_mode, lookup_value), build_output_defaults("NOT FOUND"))
                 if result["file_reference"] != "NOT FOUND":
                     found_rows += 1
             else:
@@ -556,17 +633,17 @@ def main() -> int:
         print("ERROR: No Legal Suite API keys found in environment")
         return 1
 
-    sheet_payloads, unique_accounts = read_workbook_rows(source_path)
-    if not unique_accounts:
-        print("ERROR: No numeric-only account numbers found")
+    sheet_payloads, unique_lookup_keys = read_workbook_rows(source_path)
+    if not unique_lookup_keys:
+        print("ERROR: No valid file references or numeric-only account numbers found")
         return 1
 
     print(
-        f"Loaded {len(sheet_payloads)} sheets; found {len(unique_accounts)} unique account numbers "
+        f"Loaded {len(sheet_payloads)} sheets; found {len(unique_lookup_keys)} unique lookup values "
         f"from row {START_ROW}"
     )
-    account_results = build_account_results(unique_accounts, clients)
-    processed_rows, found_rows = create_excel_report(sheet_payloads, account_results, output_path)
+    lookup_results = build_lookup_results(unique_lookup_keys, clients)
+    processed_rows, found_rows = create_excel_report(sheet_payloads, lookup_results, output_path)
 
     print(f"Saved: {output_path}")
     print(f"Total rows processed: {processed_rows}")
